@@ -1,300 +1,324 @@
-# FAILURE-CASCADE.md
+# CONCURRENCY.md
 
-# SwiftEats World Cup Final Failure Cascade Analysis
+# ShowTime Ticketing System - Concurrency Strategy
 
-## Scenario
+## Objective
 
-- Total users receiving notification: 180,000,000
-- Estimated CTR: 8%
-- Active users: 14,400,000
-- Users opening app in first minute: ~10,000,000
-- API calls per user:
-  - GET /restaurants
-  - GET /restaurant/:id
-  - POST /orders
+Prevent double-booking of seats during high-demand events while supporting:
+
+- 500,000 concurrent users
+- Response time < 500ms
+- AWS budget ≤ $2,000/month
 
 ---
 
-## 1. Traffic Simulation Math
+# Option A: PostgreSQL Row-Level Locking
 
-Total Requests:
+## Approach
 
-10,000,000 users × 3 API calls
+Use SELECT ... FOR UPDATE inside a transaction.
 
-= 30,000,000 requests
+Example:
 
-Peak Window = 60 seconds
+BEGIN;
 
-Peak RPS:
+SELECT id
+FROM seats
+WHERE id = $1
+AND status = 'available'
+FOR UPDATE;
 
-30,000,000 / 60
+UPDATE seats
+SET status = 'held',
+    held_until = NOW() + INTERVAL '10 minutes'
+WHERE id = $1;
 
-= 500,000 Requests/Second
+COMMIT;
 
-### Result
+### How It Prevents Double Booking
 
-Expected Traffic = **500,000 RPS**
+The first transaction acquires the row lock.
 
-Current Capacity = **~12,000 RPS**
+Any other transaction attempting to access the same seat must wait.
 
-Demand exceeds capacity by:
+Only one transaction can update the seat.
 
-500,000 / 12,000
-
-≈ **41.6×**
+Therefore two bookings cannot confirm the same seat.
 
 ---
 
-## 2. Component Capacity Numbers
+## Capacity Analysis
 
-### PostgreSQL
+Assumptions:
 
-Configured:
-
-max_connections = 100
-
-Average query time = 20ms
-
-Payment hold time = 800ms
-
-Assume:
-
-- 70% requests are normal queries
-- 30% requests involve payment
+- PgBouncer pool size = 500 connections
+- 80% normal requests
+- 20% payment requests
+- Normal query time = 20ms
+- Payment processing = 800ms
 
 Formula:
 
-Connections Held =
-(0.7 × RPS × 0.02)
-+
-(0.3 × RPS × 0.8)
+Connections Held
 
-Pool Exhaustion:
+= (0.8 × RPS × 0.02)
 
-100 =
-(0.014RPS)
-+
-(0.24RPS)
++ (0.2 × RPS × 0.8)
 
-100 = 0.254RPS
+= 0.016RPS + 0.16RPS
 
-RPS ≈ 394
+= 0.176RPS
+
+Pool exhaustion:
+
+500 = 0.176RPS
+
+RPS = 500 / 0.176
+
+RPS ≈ 2841
 
 ### Finding
 
-Database exhausts at roughly **394 RPS**
+Pool exhausts at roughly:
 
-System receives **500,000 RPS**
+2,841 RPS
 
-Collapse is immediate.
-
----
-
-### Node.js Capacity
-
-Single Process
-
-- 1 CPU
-- 4GB RAM
-
-Observed practical limit:
-
-12,000–15,000 RPS
-
-At higher traffic:
-
-- Event loop backlog grows
-- Response time spikes
-- Heap fills
-- OOM crash
+This is far below expected Coldplay launch traffic.
 
 ---
 
-### Payment Service
+## Risks
 
-Synchronous payment request:
+### Deadlocks
 
-200–2000ms
+Scenario:
 
-Average:
+User A:
+- Seat A12
+- Seat A13
 
-800ms
+User B:
+- Seat A13
+- Seat A12
 
-DB connection remains occupied during payment.
+Both lock seats in different order.
 
 Result:
 
-Pool exhaustion occurs far earlier than expected.
+Deadlock.
+
+### Mitigation
+
+Always lock seats in ascending seat_id order.
+
+Example:
+
+ORDER BY seat_id ASC
+
+before acquiring locks.
 
 ---
 
-## 3. Failure Cascade
+# Option B: Redis Distributed Lock
+
+## Approach
+
+Acquire seat lock before touching database.
+
+Key format:
+
+seat_lock:{event_id}:{seat_id}
+
+Example:
+
+seat_lock:101:A12
 
 ---
 
-### Failure 1 — PostgreSQL Pool Exhaustion
+## Lock Acquisition
 
-Severity: CRITICAL
+SET lock_key value NX EX 30
 
-Trigger:
+Parameters:
 
-~394 RPS
+NX = only create if not existing
 
-Observed Behaviour:
+EX = expire automatically
 
-- New connections rejected
-- Queries timeout
-- API returns 500
+TTL = 30 seconds
 
-User Impact:
+If lock acquisition fails:
 
-Cannot browse menus or place orders.
+Return:
 
-Causes:
-
-Node request queue buildup.
+SEAT_TEMPORARILY_UNAVAILABLE
 
 ---
 
-### Failure 2 — Node.js Event Loop Saturation
+## Release Logic
 
-Severity: CRITICAL
+Use Lua script.
 
-Trigger:
+if redis.call("get",KEYS[1]) == ARGV[1]
+then
+    return redis.call("del",KEYS[1])
+else
+    return 0
+end
 
-~12,000–15,000 RPS
-
-Observed Behaviour:
-
-- Response times rise from 50ms → 5s+
-- Requests queue indefinitely
-
-User Impact:
-
-App appears frozen.
-
-Causes:
-
-Memory growth and eventual crash.
+This prevents deleting another user's lock.
 
 ---
 
-### Failure 3 — Synchronous Payment Amplification
+## What If Redis Fails?
 
-Severity: HIGH
+If Redis becomes unavailable:
 
-Trigger:
+- New locks cannot be created.
+- Booking flow is paused.
+- Existing confirmed bookings remain safe.
 
-Large ordering surge
+Because final booking confirmation still occurs inside PostgreSQL transaction.
 
-Observed Behaviour:
+No double-booking occurs.
 
-- Connections held for 800ms+
-- Payment gateway latency propagates to DB
-
-User Impact:
-
-Orders stuck in processing.
-
-Causes:
-
-Pool exhaustion accelerates.
+Availability decreases but correctness remains intact.
 
 ---
 
-### Failure 4 — Promo Code Race Condition
+## TTL Selection
 
-Severity: HIGH
+Chosen TTL:
 
-Trigger:
+30 seconds
 
-Millions redeem simultaneously
+### Too Short
 
-Observed Behaviour:
+5 seconds:
 
-SELECT promo
-UPDATE promo
+- Slow network may expire lock.
+- Another user acquires same seat.
 
-Executed separately.
+### Too Long
 
-User Impact:
+5 minutes:
 
-Promo oversold.
+- Abandoned sessions block inventory.
 
-Business Impact:
+### Why 30 Seconds
 
-Revenue loss due to excessive discounts.
+Enough time to:
 
----
+- Verify seat
+- Create booking
+- Persist hold
 
-### Failure 5 — Static Asset Saturation
-
-Severity: HIGH
-
-Trigger:
-
-10M users requesting images
-
-Calculation:
-
-10M users × 20 images × 200KB
-
-≈ 40TB transfer
-
-Observed Behaviour:
-
-Network bandwidth exhausted.
-
-User Impact:
-
-Images fail to load.
-
-Causes:
-
-API becomes unreachable.
+Without blocking inventory excessively.
 
 ---
 
-### Failure 6 — Monitoring Blindness
+# Chosen Strategy
 
-Severity: MEDIUM
+## Hybrid Approach
 
-Observed Behaviour:
+We choose:
 
-No tracing.
+Redis SETNX + PostgreSQL Transaction
 
-No correlation IDs.
+### Booking Flow
 
-No clear root cause visibility.
-
-Impact:
-
-MTTD increases to 30–45 minutes.
-
----
-
-## 4. Incident Timeline
-
-| Time | Event |
-|--------|--------|
-| T+0s | Push notification sent |
-| T+3s | PostgreSQL pool exhausted |
-| T+5s | Response times increase sharply |
-| T+8s | Connection failures begin |
-| T+10s | Payment timeouts occur |
-| T+12s | Promo budget oversold |
-| T+15s | NIC saturation from image traffic |
-| T+18s | Node.js crashes with OOM |
-| T+20s | Service fully unavailable |
-| T+45m | Root cause identified |
-| T+2h | Service restored |
+1. Acquire Redis seat lock.
+2. Verify seat availability.
+3. Update seat to HELD.
+4. Create booking record.
+5. Commit transaction.
+6. Release Redis lock.
 
 ---
 
-## Key Findings
+# Why Hybrid?
 
-1. PostgreSQL fails first at ~394 RPS.
-2. Incoming traffic reaches 500,000 RPS.
-3. Demand exceeds Node capacity by 41×.
-4. Payment calls amplify database failures.
-5. Lack of CDN causes 40TB image traffic to hit origin servers.
+### Capacity
+
+PostgreSQL-only locking fails around:
+
+≈ 2,841 RPS
+
+Coldplay sale traffic can exceed:
+
+50,000+ RPS
+
+Redis handles:
+
+100,000+ lock operations/sec
+
+without stressing database connections.
+
+---
+
+### Cost
+
+A small Redis cluster fits inside the $2,000 budget.
+
+Adding dozens of DB replicas to solve lock contention would exceed budget.
+
+---
+
+### Correctness
+
+Redis protects hot-seat contention.
+
+PostgreSQL remains source of truth.
+
+Final booking confirmation still benefits from ACID guarantees.
+
+---
+
+# Limitations
+
+This strategy cannot handle:
+
+- Complete Redis cluster outage
+- Region-wide network failure
+- Simultaneous multi-region booking races
+
+Additional mechanisms would be required:
+
+- Multi-AZ Redis
+- Cross-region consensus
+- Event sourcing
+
+---
+
+# When Would We Switch?
+
+We would switch to PostgreSQL-only locking if:
+
+- Concurrent booking traffic < 5,000 users
+- Infrastructure budget extremely limited
+- Simplicity is preferred over throughput
+
+We would keep Hybrid for:
+
+- IPL Finals
+- Coldplay sales
+- Cricket World Cup
+- Any event expecting massive contention
+
+---
+
+# Final Decision
+
+Chosen Strategy:
+
+Redis SETNX Distributed Lock + PostgreSQL Transactions
+
+Reason:
+
+Provides the best balance between:
+
+- Throughput
+- Correctness
+- Cost
+
+while ensuring zero double-bookings under extreme traffic spikes.
