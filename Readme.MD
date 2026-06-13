@@ -1,109 +1,89 @@
-# ShowTime Ticketing System Architecture
+# QuickBite Performance Optimization Audit
 
-## Full System Diagram
+## Overview
 
-Mobile App / Browser
-        │
-        │ HTTPS Request
-        ▼
-┌─────────────────────────────┐
-│ CloudFront CDN              │
-│ - Static assets             │
-│ - Event pages cache         │
-│ TTL: 1 hour                 │
-└─────────────────────────────┘
-        │
-        │ Cache Miss / API Call
-        ▼
-┌─────────────────────────────┐
-│ Application Load Balancer   │
-│ - SSL Termination           │
-│ - Health Check: 10 sec      │
-│ - Rate Limit: 200 req/min   │
-└─────────────────────────────┘
-        │
-        ▼
-┌────────────────────────────────────────────┐
-│ Node.js API Cluster (4–20 instances)       │
-│ Auto-scale when CPU > 70%                  │
-│                                            │
-│ Responsibilities:                          │
-│ • Authentication                           │
-│ • Booking APIs                             │
-│ • Redis Lock Acquisition                   │
-│ • Cache Reads                              │
-│ • Publish Payment Events                   │
-└────────────────────────────────────────────┘
-        │
-        ├─────────────────────────────┐
-        │                             │
-        ▼                             ▼
+This project focuses on profiling, analyzing, and optimizing the QuickBite backend API.
 
-┌─────────────────┐        ┌──────────────────┐
-│ Redis Cluster   │        │ PostgreSQL       │
-│ (3 Nodes)       │        │ Primary          │
-├─────────────────┤        ├──────────────────┤
-│ Cache Keys      │        │ Write Traffic    │
-│                 │        │                  │
-│ event:{id}      │        │ Create Booking   │
-│ availability:*  │        │ Update Seats     │
-│ seatmap:*       │        │ Payment Updates  │
-│                 │        │                  │
-│ Distributed     │        │                  │
-│ Locks           │        │                  │
-│ seat_lock:*     │        │                  │
-└─────────────────┘        └────────┬─────────┘
-                                    │
-                                    │ Replication
-                                    ▼
+The objective was to identify performance bottlenecks, measure baseline system behavior, analyze database query execution, eliminate N+1 query patterns, add missing indexes, and validate improvements through benchmarking.
 
-                    ┌─────────────────────────┐
-                    │ Read Replica 1          │
-                    │ Event Details           │
-                    │ User Booking History    │
-                    └─────────────────────────┘
+---
 
-                    ┌─────────────────────────┐
-                    │ Read Replica 2          │
-                    │ Seat Map Reads          │
-                    │ Availability Queries    │
-                    └─────────────────────────┘
+## Work Completed
 
-        │
-        │ Publish Booking Event
-        ▼
+### 1. Baseline Performance Profiling
 
-┌─────────────────────────────┐
-│ SQS Payment Queue           │
-├─────────────────────────────┤
-│ Visibility Timeout: 20 sec  │
-│ Max Receive Count: 3        │
-│ DLQ Enabled                 │
-└─────────────────────────────┘
-        │
-        ▼
+Performed load testing using Artillery to establish current system performance.
 
-┌─────────────────────────────┐
-│ ECS Payment Workers         │
-├─────────────────────────────┤
-│ 1. Read SQS Message         │
-│ 2. Call Razorpay            │
-│ 3. Update DB                │
-│ 4. Publish Notification     │
-│ 5. Delete SQS Message       │
-└─────────────────────────────┘
-        │
-        ▼
+Metrics collected:
 
-┌─────────────────────────────┐
-│ AWS SNS                     │
-└─────────────────────────────┘
-        │
-        ├──────────────┐
-        ▼              ▼
+- P50 latency
+- P95 latency
+- Error rate
+- Throughput
 
-┌─────────────┐  ┌─────────────┐
-│ SES Email   │  │ SMS Gateway │
-│ Booking     │  │ Ticket SMS  │
-│ Confirmation│  │ Confirmation│
-└─────────────┘  └─────────────┘
+Endpoints tested:
+
+- GET /api/restaurants
+- GET /api/restaurants/:id/menu
+- GET /api/orders/history
+- POST /api/orders
+
+### Key Findings
+
+- High response times on restaurant and order endpoints.
+- Significant degradation under concurrent traffic.
+- Increased error rates during peak load.
+
+---
+
+## 2. Query Count Instrumentation
+
+Added query-count logging middleware to measure database activity per request.
+
+### Findings
+
+| Endpoint | Queries |
+|-----------|----------|
+| GET /api/restaurants | 1 |
+| GET /api/restaurants/:id/menu | 23 |
+| GET /api/orders/history | 101 |
+
+### Issues Identified
+
+- Multiple database queries executed inside loops.
+- Severe N+1 query problem in order history.
+- Excessive database round trips.
+
+---
+
+## 3. Database Profiling with EXPLAIN ANALYZE
+
+Analyzed slow queries using PostgreSQL EXPLAIN ANALYZE.
+
+### Queries Investigated
+
+1. Order History Query
+2. Order Items Lookup
+3. Restaurant Menu Query
+
+### Findings
+
+- Sequential scans on large tables.
+- Missing indexes.
+- Poor query execution plans.
+- Large number of rows scanned unnecessarily.
+
+---
+
+## 4. N+1 Query Optimization
+
+### Problem
+
+Application fetched related records individually inside loops.
+
+Example:
+
+```js
+for (const order of orders) {
+  await db.query(...)
+}
